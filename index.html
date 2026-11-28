@@ -235,6 +235,10 @@
       background: #2c5a3c
     }
 
+    .board{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:.8vw;width:100%;max-width:1400px;text-align:left}
+.bw{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:.5vw 1vw;font-size:clamp(1rem,1.7vw,1.5rem)}
+.bw small{display:block;color:var(--mute);font-size:.7em}
+
     :focus-visible {
       outline: 2px solid var(--gold);
       outline-offset: 2px
@@ -276,7 +280,7 @@
     const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
     const S = { people: [], dyn: [], qs: [], ans: [], win: [], ent: [], gs: {}, prizes: [] };
     const dyn = id => S.dyn.find(d => d.id === id), who = id => S.people.find(p => p.id === id)?.name ?? "—";
-    const winnerOf = id => S.win.find(w => w.dynamic_id === id);
+    const winnersOf = id => S.win.filter(w => w.dynamic_id === id).sort((a, b) => (a.rank || 0) - (b.rank || 0));
     const toast = (t) => { const m = $("msg"); m.textContent = t; m.style.display = "block"; setTimeout(() => m.style.display = "none", 2500); };
     async function q(p) { const r = await p; if (r.error) { toast(r.error.message); throw r.error; } return r.data; }
     const qr = (el, text, size) => { el.innerHTML = ""; new QRCode(el, { text, width: size, height: size, colorDark: "#12332b", colorLight: "#f3eedc" }); };
@@ -286,7 +290,7 @@
     async function load() {
       if (!sb) { $("app").innerHTML = `<div class="wrap card">Configura SUPABASE_URL y SUPABASE_ANON_KEY al inicio del archivo.</div>`; return; }
       const [people, dynamics, qs, ans, win, ent, gs, prizes] = await Promise.all(["participants", "dynamics", "questions", "answers", "winners", "entries", "game_state", "prizes"].map(t => q(sb.from(t).select("*"))));
-Object.assign(S, { people: people.sort((a, b) => a.name.localeCompare(b.name)), dyn: dynamics.sort((a, b) => a.position - b.position), qs: qs.sort((a, b) => a.position - b.position), ans, win, ent, gs: gs[0] || {}, prizes: prizes.sort((a, b) => a.name.localeCompare(b.name)) });
+Object.assign(S, { people: people.sort((a, b) => a.name.localeCompare(b.name)), dyn: dynamics.sort((a, b) => a.position - b.position), qs: qs.sort((a, b) => a.position - b.position), ans, win, ent, gs: gs[0] || {}, prizes: prizes.sort((a, b) => a.created_at.localeCompare(b.created_at)) });
       const sig = JSON.stringify(S); if (sig === last) return; last = sig;
       if (typing()) { dirty = true; return; }
       draw();
@@ -294,7 +298,7 @@ Object.assign(S, { people: people.sort((a, b) => a.name.localeCompare(b.name)), 
     const typing = () => V === "admin" && /INPUT|SELECT/.test(document.activeElement?.tagName) && document.activeElement.type !== "checkbox";
     document.addEventListener("focusout", () => setTimeout(() => { if (dirty && !typing()) { dirty = false; draw(); } }, 80));
     let t0; const soon = () => { clearTimeout(t0); t0 = setTimeout(load, 250); };
-    function draw() { ({ admin, screen, play })[V]?.(); prevPhase = S.gs.phase; }
+    function draw() { ({ admin, screen, play, board })[V]?.(); prevPhase = S.gs.phase; }
     function start() {
       if (V === "admin" && sessionStorage.ok !== "1") { if (prompt("PIN de administrador") !== ADMIN_PIN) { document.body.innerHTML = "<p style='padding:20px'>Acceso restringido.</p>"; return; } sessionStorage.ok = "1"; }
       load(); if (sb) { sb.channel("all").on("postgres_changes", { event: "*", schema: "public" }, soon).subscribe(); setInterval(load, 4000); }
@@ -311,10 +315,20 @@ Object.assign(S, { people: people.sort((a, b) => a.name.localeCompare(b.name)), 
       return Object.entries(m).map(([id, pts]) => ({ id, pts })).sort((a, b) => b.pts - a.pts);
     }
     const setGS = patch => q(sb.from("game_state").update({ ...patch, updated_at: new Date().toISOString() }).eq("id", 1)).then(load);
-    async function saveWinner(did, pid, method, detail) {
-      await q(sb.from("winners").upsert({ dynamic_id: did, participant_id: pid, method, detail }, { onConflict: "dynamic_id" }));
-      await q(sb.from("dynamics").update({ status: "finished" }).eq("id", did));
-    }
+  function pickMany(list, n) {
+  const pool = [...list], out = [];
+  while (out.length < n && pool.length) { const { p } = weightedPick(pool); out.push(p); pool.splice(pool.indexOf(p), 1); }
+  return out;
+}
+const prizeSlots = did => S.prizes.filter(p => p.dynamic_id === did).flatMap(p => Array(p.quantity).fill(p.id));
+async function saveWinners(did, people, method) {
+  const slots = prizeSlots(did);
+  const rows = people.map((p, i) => ({ dynamic_id: did, participant_id: p.id, rank: i + 1, prize_id: slots[i] || null, method, detail: { multiplier: p.multiplier } }));
+  await q(sb.from("winners").delete().eq("dynamic_id", did));
+  await q(sb.from("winners").insert(rows));
+  await q(sb.from("dynamics").update({ status: "finished" }).eq("id", did));
+}
+const wonElsewhere = did => new Set(S.win.filter(w => w.dynamic_id !== did).map(w => w.participant_id));
 
     // =====================================================
     //  ADMIN
@@ -332,7 +346,7 @@ Object.assign(S, { people: people.sort((a, b) => a.name.localeCompare(b.name)), 
     function aLive() {
       const g = S.gs, d = dyn(g.dynamic_id);
       if (!d || g.phase === "idle") { $("pane").innerHTML = `<div class="card mute">No hay dinámica activa. Lánzala desde la pestaña Dinámicas.</div>`; return; }
-      const joined = S.ent.filter(e => e.dynamic_id === d.id), w = winnerOf(d.id);
+      const joined = S.ent.filter(e => e.dynamic_id === d.id), ws = winnersOf(d.id);
       let body = "";
       if (d.type === "quiz") {
         const ql = S.qs.filter(x => x.dynamic_id === d.id);
@@ -341,34 +355,39 @@ Object.assign(S, { people: people.sort((a, b) => a.name.localeCompare(b.name)), 
     <div class="card"><h3>Puntajes</h3><table>${scores(d.id).map(r => `<tr><td>${esc(who(r.id))}</td><td>${r.pts} pt</td></tr>`).join("") || "<tr><td class='mute'>Sin respuestas</td></tr>"}</table></div>`;
       } else {
         const tot = joined.reduce((a, e) => a + Number(S.people.find(p => p.id === e.participant_id)?.multiplier || 1), 0);
-        body = `<div class="card"><div class="row"><button class="b" onclick="raffle('${d.id}')" ${w ? "disabled" : ""}>Sortear</button></div>
+        body = `<div class="card"><div class="row"><button class="b" onclick="raffle('${d.id}')" ${ws.length ? "disabled" : ""}>Sortear</button></div>
     <table>${joined.map(e => { const p = S.people.find(p => p.id === e.participant_id); return p ? `<tr><td>${esc(p.name)}</td><td>x${p.multiplier}</td><td class="mute">${(p.multiplier / tot * 100).toFixed(1)}%</td></tr>` : ""; }).join("")}</table></div>`;
       }
-      $("pane").innerHTML = `<div class="card"><h3>${esc(d.name)}</h3><div class="mute">Fase: ${g.phase} · ${joined.length} se han unido</div>${w ? `<div class="win">🏆 ${esc(who(w.participant_id))}</div>` : ""}
+      $("pane").innerHTML = `<div class="card"><h3>${esc(d.name)}</h3><div class="mute">Fase: ${g.phase} · ${joined.length} se han unido</div>${ws.length ? `<div class="win">🏆 ${ws.length} ganadores</div>` : ""}
   <div class="row"><button class="b alt" onclick="setGS({phase:'lobby'})">Volver al QR</button><button class="b alt" onclick="setGS({phase:'idle',dynamic_id:null,question_id:null})">Cerrar dinámica</button></div></div>${body}`;
     }
-    async function quizWinner(did) {
-      const s = scores(did); if (!s.length) return toast("Sin respuestas");
-      const tied = s.filter(r => r.pts === s[0].pts).map(r => S.people.find(p => p.id === r.id)), { p } = weightedPick(tied);
-      await saveWinner(did, p.id, "quiz", { points: s[0].pts, tied: tied.length }); setGS({ phase: "winner" });
-    }
-    async function raffle(did) {
-      const pool = S.ent.filter(e => e.dynamic_id === did).map(e => S.people.find(p => p.id === e.participant_id)).filter(Boolean);
-      if (!pool.length) return toast("Nadie se ha unido todavía");
-      const { p, prob } = weightedPick(pool);
-      await saveWinner(did, p.id, "weighted_raffle", { multiplier: p.multiplier, probability: prob }); setGS({ phase: "winner" });
-    }
+   async function quizWinner(did) {
+  const n = dyn(did).winner_count || 25, won = wonElsewhere(did);
+  const s = scores(did).filter(r => !won.has(r.id));
+  if (!s.length) return toast("Sin respuestas");
+  const cut = s[Math.min(n, s.length) - 1].pts, byId = r => S.people.find(p => p.id === r.id);
+  const sure = s.filter(r => r.pts > cut).map(byId), tied = s.filter(r => r.pts === cut).map(byId);
+  await saveWinners(did, [...sure, ...pickMany(tied, n - sure.length)].filter(Boolean), "quiz"); setGS({ phase: "winner" });
+}
+async function raffle(did) {
+  const n = dyn(did).winner_count || 25, won = wonElsewhere(did);
+  const pool = S.ent.filter(e => e.dynamic_id === did && !won.has(e.participant_id)).map(e => S.people.find(p => p.id === e.participant_id)).filter(Boolean);
+  if (!pool.length) return toast("Nadie disponible para el sorteo");
+  await saveWinners(did, pickMany(pool, n), "weighted_raffle"); setGS({ phase: "winner" });
+}
     function aDyn() {
-      $("pane").innerHTML = `<div class="grid">${S.dyn.map(d => {
-        const w = winnerOf(d.id); return `<div class="card"><h3>${d.position}. ${esc(d.name)}</h3>
-    <div class="row"><input value="${esc(d.name)}" onchange="upd('${d.id}',{name:this.value})"><input value="${esc(d.prize || "")}" placeholder="Premio" onchange="upd('${d.id}',{prize:this.value})">
-    <select onchange="upd('${d.id}',{type:this.value})"><option value="quiz" ${d.type === "quiz" ? "selected" : ""}>Cuestionario</option><option value="raffle" ${d.type === "raffle" ? "selected" : ""}>Sorteo</option></select></div>
+  $("pane").innerHTML = `<div class="grid">${S.dyn.map(d => {
+    const ws = winnersOf(d.id); return `<div class="card"><h3>${d.position}. ${esc(d.name)}</h3>
+    <div class="row"><input value="${esc(d.name)}" onchange="upd('${d.id}',{name:this.value})">
+    <select onchange="upd('${d.id}',{type:this.value})"><option value="quiz" ${d.type === "quiz" ? "selected" : ""}>Cuestionario</option><option value="raffle" ${d.type === "raffle" ? "selected" : ""}>Sorteo</option></select>
+    <input type="number" min="1" value="${d.winner_count}" style="width:80px" title="Ganadores" onchange="upd('${d.id}',{winner_count:+this.value})"></div>
+    <div class="mute">${ws.length} de ${d.winner_count} ganadores</div>
     <div class="qr" id="qr-${d.id}"></div><div class="mute" style="word-break:break-all;font-size:.75rem">${link("play", d.id)}</div>
-    <div class="row"><button class="b" onclick="launch('${d.id}')">Lanzar</button>${w ? `<button class="b alt" onclick="resetW('${d.id}')">Reiniciar</button>` : ""}</div>
-    ${w ? `<div class="win">🏆 ${esc(who(w.participant_id))}</div>` : ""}</div>`;
-      }).join("")}</div>`;
-      S.dyn.forEach(d => qr($("qr-" + d.id), link("play", d.id), 140));
-    }
+    <div class="row"><button class="b" onclick="launch('${d.id}')">Lanzar</button>${ws.length ? `<button class="b alt" onclick="resetW('${d.id}')">Reiniciar</button>` : ""}</div>
+    ${ws.length ? `<div class="win">🏆 ${ws.length} ganadores</div>` : ""}</div>`;
+  }).join("")}</div>`;
+  S.dyn.forEach(d => qr($("qr-" + d.id), link("play", d.id), 140));
+}
     const upd = (id, patch) => q(sb.from("dynamics").update(patch).eq("id", id)).then(load);
     const launch = async id => { await q(sb.from("dynamics").update({ status: "active" }).eq("id", id)); tab = "live"; setGS({ dynamic_id: id, question_id: null, phase: "lobby" }); };
     async function resetW(id) { if (confirm("¿Borrar ganador?")) { await q(sb.from("winners").delete().eq("dynamic_id", id)); upd(id, { status: "pending" }); } }
@@ -504,11 +523,11 @@ Object.assign(S, { people: people.sort((a, b) => a.name.localeCompare(b.name)), 
     let spinning = false;
     function screen() {
       if (spinning) return;
-      const g = S.gs, d = dyn(g.dynamic_id), ph = g.phase, x = S.qs.find(x => x.id === g.question_id), w = d && winnerOf(d.id);
+      const g = S.gs, d = dyn(g.dynamic_id), ph = g.phase, x = S.qs.find(x => x.id === g.question_id), ws = d ? winnersOf(d.id) : [];
       let h = "";
       if (!d || ph === "idle") {
-        h = `<h1>Cena de fin de año</h1><div class="big mute">Preparando la siguiente dinámica…</div>
-    <div class="row" style="justify-content:center;gap:2vw">${S.dyn.filter(z => winnerOf(z.id)).map(z => `<div class="card"><div class="mute">${esc(z.name)}</div><div class="win">🏆 ${esc(who(winnerOf(z.id).participant_id))}</div></div>`).join("")}</div>`;
+        h = `<h1>Cena de fin de año</h1><div class="big mute">${S.win.length} ganadores hasta ahora</div>
+<div class="row" style="justify-content:center;gap:2vw">${S.dyn.filter(z => winnersOf(z.id).length).map(z => `<div class="card"><div class="mute">${esc(z.name)}</div><div class="win">🏆 ${winnersOf(z.id).length} ganadores</div></div>`).join("")}</div>`;
       } else if (ph === "lobby") {
         h = `<h1>${esc(d.name)}</h1>${d.prize ? `<div class="big gold">${esc(d.prize)}</div>` : ""}<div class="qr" id="qr"></div>
     <div class="big">Escanea para unirte</div><div class="mute" style="font-size:1.6rem">${S.ent.filter(e => e.dynamic_id === d.id).length} participantes dentro</div>`;
@@ -521,22 +540,26 @@ Object.assign(S, { people: people.sort((a, b) => a.name.localeCompare(b.name)), 
         const c = x.options.map((_, i) => S.ans.filter(a => a.question_id === x.id && a.selected_index === i).length), mx = Math.max(1, ...c);
         h = `<div class="big">${esc(x.text)}</div><div class="opts">${x.options.map((o, i) => `<div class="opt ${i === x.correct_index ? "ok" : ""}"><i style="width:${c[i] / mx * 100}%"></i><span><b class="gold">${"ABCD"[i]}</b> ${esc(o)} · ${c[i]}</span></div>`).join("")}</div>
     <div class="mute" style="font-size:1.5rem">${scores(d.id).slice(0, 3).map(r => `${esc(who(r.id))} ${r.pts} pt`).join("  ·  ")}</div>`;
-      } else if (ph === "winner" && w) {
-        if (d.type === "raffle" && prevPhase && prevPhase !== "winner") { spinAnim(d, w); return; }
-        h = winnerHTML(d, w);
-      } else h = `<h1>${esc(d?.name || "")}</h1>`;
+      } else if (ph === "winner" && ws.length) {
+  if (d.type === "raffle" && prevPhase && prevPhase !== "winner") { spinAnim(d); return; }
+  h = boardHTML(d);
+} else h = `<h1>${esc(d?.name || "")}</h1>`;
       $("app").innerHTML = `<div class="scr">${h}</div>`;
       if (ph === "lobby") qr($("qr"), link("play", d.id), 320);
     }
-    const winnerHTML = (d, w) => `<div class="big mute">${esc(d.name)}</div><h1 class="gold">🏆 ${esc(who(w.participant_id))}</h1>${d.prize ? `<div class="big">${esc(d.prize)}</div>` : ""}`;
-    function spinAnim(d, w) {
-      spinning = true; const pool = S.ent.filter(e => e.dynamic_id === d.id).map(e => who(e.participant_id)); let n = 0;
-      $("app").innerHTML = `<div class="scr"><div class="big mute">${esc(d.name)}</div><h1 class="gold" id="sp"></h1></div>`;
-      const t = setInterval(() => {
-        if (++n > 30) { clearInterval(t); spinning = false; $("app").innerHTML = `<div class="scr">${winnerHTML(d, w)}</div>`; return; }
-        $("sp").textContent = pool[Math.floor(Math.random() * pool.length)] || "…";
-      }, 100);
-    }
+    const cells = ws => ws.map((w, i) => `<div class="bw"><b class="gold">${i + 1}</b> ${esc(who(w.participant_id))}<small>${esc(S.prizes.find(p => p.id === w.prize_id)?.name || "")}</small></div>`).join("");
+const boardHTML = d => `<div class="big gold">${esc(d.name)}</div><div class="board">${cells(winnersOf(d.id))}</div>`;
+function board() {
+  $("app").innerHTML = `<div class="wrap"><h1>Ganadores</h1>${S.dyn.map(d => { const ws = winnersOf(d.id); return ws.length ? `<div class="card"><h3>${esc(d.name)} · ${ws.length}</h3><div class="board">${cells(ws)}</div></div>` : ""; }).join("")}</div>`;
+}
+function spinAnim(d) {
+  spinning = true; const pool = S.ent.filter(e => e.dynamic_id === d.id).map(e => who(e.participant_id)); let n = 0;
+  $("app").innerHTML = `<div class="scr"><div class="big mute">${esc(d.name)}</div><h1 class="gold" id="sp"></h1></div>`;
+  const t = setInterval(() => {
+    if (++n > 30) { clearInterval(t); spinning = false; $("app").innerHTML = `<div class="scr">${boardHTML(d)}</div>`; return; }
+    $("sp").textContent = pool[Math.floor(Math.random() * pool.length)] || "…";
+  }, 100);
+}
 
     // =====================================================
     //  CELULAR (público)
@@ -553,14 +576,14 @@ Object.assign(S, { people: people.sort((a, b) => a.name.localeCompare(b.name)), 
       const g = S.gs, d = dyn(D), x = S.qs.find(x => x.id === g.question_id), live = d && g.dynamic_id === D && g.phase !== "idle";
       let b;
       if (!d) b = `<p>Escanea el QR de la dinámica que aparece en la pantalla.</p>`;
-      else if (!live) { const w = winnerOf(D); b = w ? `<h3>${esc(d.name)}</h3><p>Ganó <b class="gold">${esc(who(w.participant_id))}</b></p>` : `<h3>${esc(d.name)}</h3><p class="mute">Todavía no empieza. Espera tu turno.</p>`; }
+     else if (!live) { b = winnersOf(D).length ? `<h3>${esc(d.name)}</h3><p>Esta dinámica ya terminó. ¡Gracias por jugar!</p>` : `<h3>${esc(d.name)}</h3><p class="mute">Todavía no empieza. Espera tu turno.</p>`; }
       else {
         if (!S.ent.some(e => e.dynamic_id === D && e.participant_id === me.id) && !joining) { joining = true; q(sb.from("entries").upsert({ dynamic_id: D, participant_id: me.id })).then(() => { joining = false; load(); }); }
-        const ph = g.phase, w = winnerOf(D), a = x && S.ans.find(a => a.question_id === x.id && a.participant_id === me.id);
+        const ph = g.phase, a = x && S.ans.find(a => a.question_id === x.id && a.participant_id === me.id);
         if (ph === "lobby") b = `<h3>${esc(d.name)}</h3><p>✅ Ya estás dentro. Mira la pantalla.</p>`;
         else if (ph === "question" && x) b = `<h3>${esc(x.text)}</h3>${x.options.map((o, i) => `<button class="opt ${a?.selected_index === i ? "sel" : ""}" onclick="answer('${x.id}',${i})" ${a ? "disabled" : ""}>${"ABCD"[i]}. ${esc(o)}</button>`).join("")}${a ? `<p class="mute">Respuesta enviada. Espera el resultado.</p>` : ""}`;
         else if (ph === "reveal" && x) b = a ? `<h2>${a.is_correct ? "✅ ¡Correcto!" : "❌ Esta vez no"}</h2>` : `<p class="mute">No respondiste a tiempo.</p>`;
-        else if (ph === "winner" && w) b = w.participant_id === me.id ? `<h2 class="gold">🏆 ¡Ganaste!</h2><p>${esc(d.prize || "")}</p>` : `<p>Ganó <b class="gold">${esc(who(w.participant_id))}</b>. ¡Gracias por jugar!</p>`;
+        else if (ph === "winner") { const mine = S.win.find(x => x.dynamic_id === D && x.participant_id === me.id); b = mine ? `<h2 class="gold">🏆 ¡Ganaste!</h2><p>${esc(S.prizes.find(p => p.id === mine.prize_id)?.name || "")}</p>` : `<p>Gracias por jugar. Esta vez no salió tu nombre, ¡sigue participando en las siguientes!</p>`; }
         else b = `<p class="mute">Mira la pantalla…</p>`;
       }
       $("app").innerHTML = `<div class="ph"><div class="mute">Hola, ${esc(me.name)} · <a href="#" style="color:var(--mute)" onclick="localStorage.removeItem('me');draw();return false">no soy yo</a></div>${b}</div>`;
